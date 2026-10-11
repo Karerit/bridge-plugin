@@ -23,7 +23,7 @@ from collections import deque
 from dataclasses import dataclass, field
 
 SNAPSHOT_MAX_RECORDS = 200
-REPLAY_WINDOW_SEC = 5.0  # 判定「重复投递」的时间窗口
+REPLAY_WINDOW_SEC = 30.0  # 判定「重复投递」的默认时间窗口（秒），可由配置覆盖
 
 
 @dataclass
@@ -88,8 +88,12 @@ class _Session:
 class Inbox:
     """按 unified_msg_origin 分桶的消息缓冲。"""
 
-    def __init__(self) -> None:
+    def __init__(self, replay_window_sec: float = REPLAY_WINDOW_SEC) -> None:
         self._sessions: dict[str, _Session] = {}
+        # 同一 message_id + 同一发言人 + 同一内容，在这个窗口内再次出现就判为「重复投递」。
+        # 窗口不能太短：适配器重连/服务端补发的间隔经常超过几秒，超窗就会被当成新消息再回一遍。
+        # 0 表示不限时间（只按 id + 发言人 + 内容判重）。
+        self.replay_window_sec = max(0.0, float(replay_window_sec or 0))
 
     # ── 写入 ──────────────────────────────────────────────────────────────────
     def append(self, record: MsgRecord) -> MsgRecord:
@@ -107,8 +111,7 @@ class Inbox:
             sess.last_incoming_ts = now
         return record
 
-    @staticmethod
-    def _is_replay(sess: _Session, record: MsgRecord) -> bool:
+    def _is_replay(self, sess: _Session, record: MsgRecord) -> bool:
         """这条是不是「同一条消息又被投递了一次」。
 
         四个条件必须同时成立：消息 id 相同、发言人相同、内容相同、时间挨得很近。
@@ -118,7 +121,7 @@ class Inbox:
         for old in reversed(sess.records):
             if old.message_id != record.message_id:
                 continue
-            if abs(record.ts - old.ts) > REPLAY_WINDOW_SEC:
+            if self.replay_window_sec > 0 and abs(record.ts - old.ts) > self.replay_window_sec:
                 continue
             if old.sender_id == record.sender_id and old.text == record.text:
                 return True
