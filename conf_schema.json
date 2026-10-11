@@ -1,0 +1,391 @@
+{
+  "enabled": {
+    "description": "总开关：关闭后不再记录消息、也不再把消息交给 AI",
+    "type": "bool",
+    "default": true
+  },
+  "access": {
+    "description": "准入白名单 / 黑名单",
+    "type": "object",
+    "hint": "对应 qq-bridge 的 allow / deny。白名单留空时按 allowAllWhenEmpty 决定放行与否；黑名单优先级更高。",
+    "items": {
+      "allowAllWhenEmpty": {
+        "description": "白名单留空时是否放行所有会话",
+        "type": "bool",
+        "default": true,
+        "hint": "关掉它 = 只有显式列出的会话才响应（原项目的默认行为）"
+      },
+      "private": {
+        "description": "私聊白名单（QQ 号）",
+        "type": "list",
+        "default": [],
+        "hint": "例如 [\"10001\", \"10002\"]；留空表示不限制"
+      },
+      "groups": {
+        "description": "群白名单（群号）",
+        "type": "list",
+        "default": [],
+        "hint": "例如 [\"123456\"]；留空表示不限制"
+      },
+      "denyPrivate": {
+        "description": "私聊黑名单（QQ 号）",
+        "type": "list",
+        "default": []
+      },
+      "denyGroups": {
+        "description": "群黑名单（群号）",
+        "type": "list",
+        "default": []
+      }
+    }
+  },
+  "wake": {
+    "description": "唤醒门控：什么消息才交给 AI",
+    "type": "object",
+    "hint": "对应原项目的唤醒配置。mention=只被 @ / 叫名字 / 被回复 / 被提问时；probability=上面之外再按概率随机参与；anyMessage=每条都唤醒。",
+    "items": {
+      "mode": {
+        "description": "唤醒模式",
+        "type": "string",
+        "default": "mention",
+        "options": ["mention", "probability", "anyMessage"]
+      },
+      "probability": {
+        "description": "随机参与概率（仅 probability 模式）",
+        "type": "float",
+        "default": 0.1,
+        "slider": { "min": 0, "max": 1, "step": 0.01 }
+      },
+      "names": {
+        "description": "唤醒用的名字/关键词",
+        "type": "list",
+        "default": ["小鲸鱼", "DeepSeek", "deepseek", "D指导", "d指导"],
+        "hint": "消息里出现其中任意一个就唤醒。机器人的群名片/昵称也建议加进来。"
+      },
+      "question": {
+        "description": "带问号的提问是否唤醒",
+        "type": "bool",
+        "default": true
+      },
+      "replyToBot": {
+        "description": "回复机器人消息时是否唤醒",
+        "type": "bool",
+        "default": true
+      },
+      "privateAlways": {
+        "description": "私聊是否总是唤醒",
+        "type": "bool",
+        "default": true
+      }
+    }
+  },
+  "persona": {
+    "description": "人设与提示词",
+    "type": "object",
+    "items": {
+      "roleCard": {
+        "description": "人设卡（roles/ 目录下的文件名，不含 .md）",
+        "type": "string",
+        "default": "",
+        "hint": "留空则不注入人设，只用仿真协议。可用 /qq 人设 查看有哪些卡。"
+      },
+      "extraPrompt": {
+        "description": "管理员附加要求",
+        "type": "text",
+        "default": "",
+        "hint": "会拼在系统提示词末尾，用来补充群规、口头禅等"
+      },
+      "maxInjectChars": {
+        "description": "人设卡最大注入字符数",
+        "type": "int",
+        "default": 6000,
+        "slider": { "min": 500, "max": 30000, "step": 500 }
+      },
+      "maxSystemChars": {
+        "description": "系统提示词总长度上限",
+        "type": "int",
+        "default": 20000,
+        "slider": { "min": 2000, "max": 60000, "step": 1000 }
+      },
+      "injectIntoDefaultPipeline": {
+        "description": "本插件没接管的对话也注入人设与协议",
+        "type": "bool",
+        "default": true,
+        "hint": "关闭后，只有走本插件的回合才带人设"
+      }
+    }
+  },
+  "agent": {
+    "description": "Agent 与模型调用",
+    "type": "object",
+    "hint": "对应原项目的 DSH 会话。这里改用 AstrBot 的模型提供商 + tool_loop_agent。",
+    "items": {
+      "enabled": {
+        "description": "是否用本插件接管对话",
+        "type": "bool",
+        "default": true,
+        "hint": "关闭后消息直接交给 AstrBot 默认对话流程（此时仍会注入人设）"
+      },
+      "providerId": {
+        "description": "指定使用的对话模型（留空=跟随当前会话默认模型）",
+        "type": "string",
+        "default": "",
+        "_special": "select_provider"
+      },
+      "modelLabel": {
+        "description": "账本里显示的模型名（用于匹配定价表，留空则用提供商 ID）",
+        "type": "string",
+        "default": ""
+      },
+      "maxSteps": {
+        "description": "单轮最多工具调用步数",
+        "type": "int",
+        "default": 30,
+        "slider": { "min": 1, "max": 128, "step": 1 }
+      },
+      "toolCallTimeoutMs": {
+        "description": "单次工具调用超时（毫秒）",
+        "type": "int",
+        "default": 600000,
+        "hint": "qq_wait_for_messages 最长可等 10 分钟，这个值必须大于等于它，否则等待会被提前掐断",
+        "slider": { "min": 10000, "max": 900000, "step": 10000 }
+      },
+      "fallbackSendThinking": {
+        "description": "模型没调用任何发言工具时，把它的文本当回复发出去",
+        "type": "bool",
+        "default": true,
+        "hint": "原项目约定「文本只是思考，不自动发送」。但模型不听话时会显得机器人没反应，所以默认开启兜底；要严格照原项目语义可关掉。"
+      },
+      "allowSend": {
+        "description": "允许 AI 主动发言",
+        "type": "bool",
+        "default": true
+      }
+    }
+  },
+  "reply": {
+    "description": "发言方式",
+    "type": "object",
+    "items": {
+      "maxChars": {
+        "description": "单条消息最大字符数",
+        "type": "int",
+        "default": 500,
+        "slider": { "min": 50, "max": 4000, "step": 50 }
+      },
+      "maxMessagesPerTurn": {
+        "description": "单轮最多分几条发",
+        "type": "int",
+        "default": 8,
+        "slider": { "min": 1, "max": 30, "step": 1 }
+      },
+      "splitMaxChars": {
+        "description": "兜底发送时的分条长度",
+        "type": "int",
+        "default": 4000
+      },
+      "sendDelayMs": {
+        "description": "分条之间的间隔（毫秒）",
+        "type": "int",
+        "default": 300,
+        "slider": { "min": 0, "max": 5000, "step": 100 }
+      }
+    }
+  },
+  "context": {
+    "description": "上下文",
+    "type": "object",
+    "items": {
+      "snapshotLimit": {
+        "description": "每轮随消息带上的最近记录条数",
+        "type": "int",
+        "default": 20,
+        "slider": { "min": 5, "max": 100, "step": 5 }
+      }
+    }
+  },
+  "wait": {
+    "description": "等待",
+    "type": "object",
+    "items": {
+      "maxMs": {
+        "description": "qq_wait_for_messages 允许的最长等待（毫秒）",
+        "type": "int",
+        "default": 600000,
+        "slider": { "min": 10000, "max": 900000, "step": 10000 }
+      }
+    }
+  },
+  "slang": {
+    "description": "黑话学习",
+    "type": "object",
+    "hint": "对应原项目的 slang。AI 抽取的只是候选，必须在 WebUI 或 /qq 黑话确认 之后才会注入提示词。",
+    "items": {
+      "enabled": {
+        "description": "启用黑话功能",
+        "type": "bool",
+        "default": true
+      },
+      "autoLearn": {
+        "description": "自动定期抽取候选",
+        "type": "bool",
+        "default": false,
+        "hint": "开启后会按 extractIntervalMs 周期调用模型抽词，产生额外 token 消耗"
+      },
+      "extractIntervalMs": {
+        "description": "自动抽取间隔（毫秒）",
+        "type": "int",
+        "default": 3600000
+      },
+      "extractMinMessages": {
+        "description": "至少积累多少条消息才抽取",
+        "type": "int",
+        "default": 10
+      },
+      "injectMax": {
+        "description": "最多注入多少条黑话",
+        "type": "int",
+        "default": 8,
+        "slider": { "min": 0, "max": 40, "step": 1 }
+      }
+    }
+  },
+  "stickers": {
+    "description": "表情包",
+    "type": "object",
+    "items": {
+      "enabled": {
+        "description": "启用表情功能",
+        "type": "bool",
+        "default": true
+      },
+      "collectEnabled": {
+        "description": "允许 AI 收藏别人发的图",
+        "type": "bool",
+        "default": true
+      },
+      "injectMax": {
+        "description": "最多注入多少个表情到提示词",
+        "type": "int",
+        "default": 8,
+        "slider": { "min": 0, "max": 40, "step": 1 }
+      }
+    }
+  },
+  "voice": {
+    "description": "语音",
+    "type": "object",
+    "hint": "把 wav 文件放进数据目录的 voices/ 子目录即可。默认关闭。",
+    "items": {
+      "enabled": {
+        "description": "启用语音",
+        "type": "bool",
+        "default": false
+      },
+      "maxBytes": {
+        "description": "单个音频大小上限（字节）",
+        "type": "int",
+        "default": 20971520
+      },
+      "maxPerMinute": {
+        "description": "每分钟最多几条",
+        "type": "int",
+        "default": 2
+      },
+      "maxPerHour": {
+        "description": "每小时最多几条",
+        "type": "int",
+        "default": 10
+      }
+    }
+  },
+  "memory": {
+    "description": "轻量记忆",
+    "type": "object",
+    "items": {
+      "enabled": {
+        "description": "启用记忆",
+        "type": "bool",
+        "default": true
+      },
+      "injectMax": {
+        "description": "最多注入多少条记忆",
+        "type": "int",
+        "default": 12,
+        "slider": { "min": 0, "max": 50, "step": 1 }
+      }
+    }
+  },
+  "proactive": {
+    "description": "主动消息（冷场时自己开口）",
+    "type": "object",
+    "hint": "对应原项目的 proactive。开启后插件会按间隔检查会话是否冷场，命中就发起一次「主动机会」回合。",
+    "items": {
+      "enabled": {
+        "description": "启用主动消息",
+        "type": "bool",
+        "default": false
+      },
+      "checkIntervalMs": {
+        "description": "检查间隔（毫秒）",
+        "type": "int",
+        "default": 1800000
+      },
+      "idleThresholdMs": {
+        "description": "冷场多久才算空闲（毫秒）",
+        "type": "int",
+        "default": 900000
+      },
+      "probability": {
+        "description": "每次检查命中的概率",
+        "type": "float",
+        "default": 0.3,
+        "slider": { "min": 0, "max": 1, "step": 0.05 }
+      }
+    }
+  },
+  "usage": {
+    "description": "用量统计（用 AstrBot 自带的）",
+    "type": "object",
+    "hint": "本插件不自建账本：每轮结束后把 token 用量写进 AstrBot 的 provider_stats 表，在 WebUI「数据与日志 → 统计」里就能看到（含本插件的调用）。AstrBot 的用量模型只有 token，没有价格字段，所以不提供金额；统计页的时间范围是最近 1/3/7 天。",
+    "items": {
+      "enabled": {
+        "description": "把本插件的调用计入 AstrBot 统计",
+        "type": "bool",
+        "default": true
+      }
+    }
+  },
+  "memview": {
+    "description": "记忆查看页（管理员）",
+    "type": "object",
+    "hint": "在浏览器里查看所有会话的记忆，默认 http://127.0.0.1:8899/ 。默认只监听本机回环地址；要远程访问就把 host 改成 0.0.0.0 并设置 token，否则插件会拒绝启动（避免记忆被全网读到）。",
+    "items": {
+      "enabled": {
+        "description": "启用记忆查看页",
+        "type": "bool",
+        "default": true
+      },
+      "host": {
+        "description": "监听地址（127.0.0.1 表示只有本机能访问）",
+        "type": "string",
+        "default": "127.0.0.1"
+      },
+      "port": {
+        "description": "监听端口",
+        "type": "int",
+        "default": 8899
+      },
+      "token": {
+        "description": "访问令牌（监听非回环地址时必填）",
+        "type": "string",
+        "default": ""
+      },
+      "allowDelete": {
+        "description": "允许在页面上删除记忆",
+        "type": "bool",
+        "default": false
+      }
+    }
+  }
+}

@@ -1,0 +1,270 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="robots" content="noindex, nofollow" />
+    <title>qq-bridge 记忆</title>
+    <style>
+      :root {
+        --bg: #f5f6f8;
+        --card: #ffffff;
+        --text: #1a1a1a;
+        --muted: #6b7280;
+        --line: #e5e7eb;
+        --accent: #2563eb;
+        --danger: #b91c1c;
+        --chip: #eef2ff;
+      }
+      @media (prefers-color-scheme: dark) {
+        :root {
+          --bg: #14161a;
+          --card: #1c1f24;
+          --text: #e8eaed;
+          --muted: #9aa0a6;
+          --line: #2c3036;
+          --accent: #7aa2f7;
+          --danger: #f87171;
+          --chip: #232a36;
+        }
+      }
+      * { box-sizing: border-box; }
+      body {
+        margin: 0;
+        padding: 24px 16px 48px;
+        background: var(--bg);
+        color: var(--text);
+        font: 14px/1.6 -apple-system, "Segoe UI", "Microsoft YaHei", system-ui, sans-serif;
+      }
+      .wrap { max-width: 920px; margin: 0 auto; }
+      header h1 { margin: 0 0 4px; font-size: 20px; }
+      header p { margin: 0; color: var(--muted); font-size: 13px; }
+      .bar {
+        display: flex; flex-wrap: wrap; gap: 8px; align-items: center;
+        margin: 16px 0; padding: 12px; background: var(--card);
+        border: 1px solid var(--line); border-radius: 10px;
+      }
+      .stats { display: flex; flex-wrap: wrap; gap: 16px; flex: 1 1 260px; }
+      .stat b { font-size: 16px; }
+      .stat span { color: var(--muted); font-size: 12px; display: block; }
+      input[type="search"] {
+        flex: 1 1 200px; padding: 8px 10px; border-radius: 8px;
+        border: 1px solid var(--line); background: var(--bg); color: var(--text);
+      }
+      button, a.btn {
+        padding: 7px 12px; border-radius: 8px; border: 1px solid var(--line);
+        background: var(--card); color: var(--text); cursor: pointer;
+        font-size: 13px; text-decoration: none; white-space: nowrap;
+      }
+      button:hover, a.btn:hover { border-color: var(--accent); color: var(--accent); }
+      button.danger { color: var(--danger); }
+      .session {
+        background: var(--card); border: 1px solid var(--line);
+        border-radius: 10px; margin-bottom: 10px; overflow: hidden;
+      }
+      .session > summary {
+        cursor: pointer; padding: 12px 14px; display: flex; gap: 10px;
+        align-items: baseline; flex-wrap: wrap; list-style: none;
+      }
+      .session > summary::-webkit-details-marker { display: none; }
+      .session .label { font-weight: 600; }
+      .session .umo { color: var(--muted); font-size: 12px; word-break: break-all; }
+      .session .count {
+        margin-left: auto; background: var(--chip); color: var(--accent);
+        border-radius: 999px; padding: 1px 10px; font-size: 12px;
+      }
+      .items { border-top: 1px solid var(--line); }
+      .item {
+        display: flex; gap: 10px; padding: 9px 14px;
+        border-bottom: 1px solid var(--line);
+      }
+      .item:last-child { border-bottom: none; }
+      .item .t { color: var(--muted); font-size: 12px; white-space: nowrap; }
+      .item .text { flex: 1; word-break: break-word; white-space: pre-wrap; }
+      .empty { color: var(--muted); padding: 28px 4px; text-align: center; }
+      .msg { color: var(--muted); font-size: 12px; }
+      .msg.err { color: var(--danger); }
+      footer { margin-top: 20px; color: var(--muted); font-size: 12px; }
+      code { background: var(--chip); padding: 1px 5px; border-radius: 4px; }
+    </style>
+  </head>
+  <body>
+    <div class="wrap">
+      <header>
+        <h1>qq-bridge 记忆</h1>
+        <p>所有会话的长期记忆，按会话分组。页面只读，删除需在配置里开启 <code>memview.allowDelete</code>。</p>
+      </header>
+
+      <div class="bar">
+        <div class="stats">
+          <div class="stat"><b id="s-sessions">–</b><span>会话</span></div>
+          <div class="stat"><b id="s-items">–</b><span>条目</span></div>
+          <div class="stat"><b id="s-time">–</b><span>生成时间</span></div>
+        </div>
+        <input id="q" type="search" placeholder="搜索记忆内容…" autocomplete="off" />
+        <button id="refresh">刷新</button>
+        <a class="btn" id="export" href="#" download>导出 JSON</a>
+        <button id="auto">自动刷新：关</button>
+      </div>
+
+      <div id="msg" class="msg"></div>
+      <div id="list"></div>
+
+      <footer>
+        数据来自 <code>data/plugin_data/astrbot_plugin_qq_bridge/memory.json</code>。
+        这个页面由插件自带的小服务提供，端口见插件配置 <code>memview.port</code>（默认 8899）。
+      </footer>
+    </div>
+
+    <script>
+      const TOKEN =
+        new URLSearchParams(location.search).get("token") || "__QQBRIDGE_TOKEN__";
+      const $ = (id) => document.getElementById(id);
+      let DATA = null;
+      let timer = null;
+
+      function apiUrl(path) {
+        const url = new URL(path, location.origin);
+        if (TOKEN && TOKEN !== "__QQBRIDGE_TOKEN__") url.searchParams.set("token", TOKEN);
+        return url;
+      }
+
+      async function api(path, options) {
+        const res = await fetch(apiUrl(path), options);
+        const text = await res.text();
+        let body = null;
+        try { body = text ? JSON.parse(text) : null; } catch (e) { body = null; }
+        if (!res.ok) {
+          const why = (body && (body.error || body.message)) || text || res.status;
+          throw new Error(why);
+        }
+        return body;
+      }
+
+      function el(tag, cls, text) {
+        const node = document.createElement(tag);
+        if (cls) node.className = cls;
+        if (text !== undefined) node.textContent = text;
+        return node;
+      }
+
+      function render() {
+        const list = $("list");
+        list.textContent = "";
+        if (!DATA || !DATA.sessions || !DATA.sessions.length) {
+          list.appendChild(el("div", "empty", "还没有任何记忆。"));
+          return;
+        }
+        const keyword = $("q").value.trim().toLowerCase();
+        let shown = 0;
+
+        DATA.sessions.forEach((session) => {
+          const items = (session.items || []).filter((item) => {
+            if (!keyword) return true;
+            return (
+              String(item.text || "").toLowerCase().includes(keyword) ||
+              String(session.label || "").toLowerCase().includes(keyword) ||
+              String(session.umo || "").toLowerCase().includes(keyword)
+            );
+          });
+          if (!items.length) return;
+          shown += 1;
+
+          const box = el("details", "session");
+          if (keyword) box.open = true;
+          const summary = el("summary");
+          summary.appendChild(el("span", "label", session.label || session.umo || "(未知会话)"));
+          summary.appendChild(el("span", "umo", session.umo || ""));
+          summary.appendChild(el("span", "count", items.length + " 条"));
+          box.appendChild(summary);
+
+          const wrap = el("div", "items");
+          items.forEach((item) => {
+            const row = el("div", "item");
+            row.appendChild(el("span", "t", item.t || ""));
+            row.appendChild(el("span", "text", item.text || ""));
+            if (DATA.allowDelete && typeof item.index === "number") {
+              const del = el("button", "danger", "删除");
+              del.addEventListener("click", async () => {
+                if (!confirm("删除这条记忆？\n\n" + (item.text || ""))) return;
+                try {
+                  await api("api/memory/delete", {
+                    method: "POST",
+                    headers: { "Content-Type": "application/json" },
+                    body: JSON.stringify({ umo: session.umo, index: item.index }),
+                  });
+                  await load();
+                } catch (error) {
+                  setMsg("删除失败：" + error.message, true);
+                }
+              });
+              row.appendChild(del);
+            }
+            wrap.appendChild(row);
+          });
+
+          if (DATA.allowDelete) {
+            const foot = el("div", "item");
+            foot.appendChild(el("span", "text", ""));
+            const clear = el("button", "danger", "清空本会话");
+            clear.addEventListener("click", async () => {
+              if (!confirm("清空「" + (session.label || session.umo) + "」的全部记忆？")) return;
+              try {
+                await api("api/memory/delete", {
+                  method: "POST",
+                  headers: { "Content-Type": "application/json" },
+                  body: JSON.stringify({ umo: session.umo, all: true }),
+                });
+                await load();
+              } catch (error) {
+                setMsg("清空失败：" + error.message, true);
+              }
+            });
+            foot.appendChild(clear);
+            wrap.appendChild(foot);
+          }
+
+          box.appendChild(wrap);
+          list.appendChild(box);
+        });
+
+        if (!shown) list.appendChild(el("div", "empty", "没有匹配的记忆。"));
+      }
+
+      function setMsg(text, isError) {
+        const node = $("msg");
+        node.textContent = text || "";
+        node.className = isError ? "msg err" : "msg";
+      }
+
+      async function load() {
+        try {
+          DATA = await api("api/memory");
+          $("s-sessions").textContent = DATA.totalSessions ?? (DATA.sessions || []).length;
+          $("s-items").textContent = DATA.totalItems ?? "";
+          $("s-time").textContent = DATA.generatedAt || "";
+          $("export").href = apiUrl("api/memory/export").toString();
+          setMsg(DATA.allowDelete ? "删除已开启。" : "只读模式。");
+          render();
+        } catch (error) {
+          setMsg("读取失败：" + error.message, true);
+        }
+      }
+
+      $("refresh").addEventListener("click", load);
+      $("q").addEventListener("input", render);
+      $("auto").addEventListener("click", () => {
+        if (timer) {
+          clearInterval(timer);
+          timer = null;
+          $("auto").textContent = "自动刷新：关";
+        } else {
+          timer = setInterval(load, 10000);
+          $("auto").textContent = "自动刷新：开";
+        }
+      });
+
+      load();
+    </script>
+  </body>
+</html>

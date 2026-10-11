@@ -1,0 +1,5 @@
+# 本插件不依赖 AstrBot 之外的第三方库：
+#   · 大模型调用走 AstrBot 的 context.tool_loop_agent / llm_generate
+#   · 持久化用标准库 json（原子写）
+#   · 图片/语音/拍一拍用 AstrBot 自带的消息组件
+# 保留本文件是为了让 AstrBot 的依赖检查有据可依；内容为空即代表无需额外安装。

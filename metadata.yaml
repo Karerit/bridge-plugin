@@ -1,0 +1,15 @@
+name: astrbot_plugin_qq_bridge
+display_name: QQ 群聊仿真桥接
+short_desc: 把 qq-bridge 的群聊仿真能力搬进 AstrBot：人设、黑话、表情、语音、主动消息、用量写入自带统计
+desc: >-
+  qq-bridge（Node.js + DSH + SnowLuma）的 AstrBot 移植版。保留原项目「AI 自主决定说不说话」的
+  群聊仿真语义：由插件独占本轮对话，模型通过 qq_send_message / qq_reply / qq_dive 等工具发言，
+  文本输出只算思考不直接发出。内置人设卡注入、群黑话学习与确认、表情包收藏、语音库、
+  冷场主动开口、拍一拍、轻量记忆，用量按 AstrBot 自己的口径写进统计（WebUI「数据与日志 → 统计」
+  可见），并附带白名单与唤醒门控。
+version: 0.1.6
+author: 由 qq-bridge 移植
+repo: https://github.com/AstrBotDevs/AstrBot
+astrbot_version: ">=4.5.7"
+support_platforms:
+  - aiocqhttp
