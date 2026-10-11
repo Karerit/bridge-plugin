@@ -7,7 +7,7 @@ desc: >-
   文本输出只算思考不直接发出。内置人设卡注入、群黑话学习与确认、表情包收藏、语音库、
   冷场主动开口、拍一拍、轻量记忆，用量按 AstrBot 自己的口径写进统计（WebUI「数据与日志 → 统计」
   可见），并附带白名单与唤醒门控。
-version: 0.1.7
+version: 0.1.9
 author: 由 qq-bridge 移植
 repo: https://github.com/AstrBotDevs/AstrBot
 astrbot_version: ">=4.5.7"

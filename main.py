@@ -137,7 +137,7 @@ class QQBridgePlugin(Star):
         )
 
         # ── 运行时 ────────────────────────────────────────────────────────────
-        self.inbox = Inbox()
+        self.inbox = Inbox(replay_window_sec=self._cfg("context.replayWindowSec", 30))
         self.voice_limiter = VoiceLimiter(
             max_per_minute=int(self._cfg("voice.maxPerMinute", 2) or 0),
             max_per_hour=int(self._cfg("voice.maxPerHour", 10) or 0),
@@ -145,6 +145,7 @@ class QQBridgePlugin(Star):
         self._turn_locks: dict[str, asyncio.Lock] = {}
         self._sent_this_turn: dict[str, bool] = {}
         self._dived_this_turn: dict[str, bool] = {}
+        self._after_dive_blocks = 0  # 收尾后又调发言工具的次数（/qq 状态 可自查）
         self._pending_wake: dict[str, tuple] = {}  # 上一轮还在跑时进来的消息，等回合结束补跑
         # 每个会话「模型已经看到过」的最大消息序号。用于两件事：① 判断排队的那条要不要补跑
         # （上一轮已经看到就别补，否则同一句会被回两次）；② 快照里标出哪些是【新】消息。
@@ -404,6 +405,13 @@ class QQBridgePlugin(Star):
         """所有消息先入缓冲，再按唤醒规则决定是否交给 AI。"""
         if not bool(self._cfg("enabled", True)):
             return
+        # 重复投递判定窗口跟随配置（改配置后无需重启插件）
+        try:
+            self.inbox.replay_window_sec = max(
+                0.0, float(self._cfg("context.replayWindowSec", 30) or 0)
+            )
+        except (TypeError, ValueError):
+            pass
         try:
             record = self._record_message(event)
         except Exception as exc:  # 记录失败不影响 AstrBot 其它插件
@@ -1098,7 +1106,8 @@ class QQBridgePlugin(Star):
             f"（成功 {self._usage_writes['ok']} / 失败 {self._usage_writes['fail']}）",
             f"回合排队：排队 {self._queue_stats['queued']} 次｜补跑 {self._queue_stats['replayed']} 次"
             + (f"｜跳过重复 {self._queue_stats['skipped']} 次" if self._queue_stats["skipped"] else "")
-            + ("（有消息在上一轮结束前到达，已自动补跑）" if self._queue_stats["queued"] else ""),
+            + ("（有消息在上一轮结束前到达，已自动补跑）" if self._queue_stats["queued"] else "")
+            + (f"｜收尾后拦截 {self._after_dive_blocks} 次" if self._after_dive_blocks else ""),
             f"记忆查看页：{self._memview_status()}",
             f"语音：{'开启' if self._cfg('voice.enabled', False) else '关闭'}｜"
             f"主动消息：{'开启' if self._cfg('proactive.enabled', False) else '关闭'}",
@@ -1274,6 +1283,37 @@ class QQBridgePlugin(Star):
             return "当前会话不在白名单里，操作被拒绝。"
         return ""
 
+    def _closed_this_turn(self, umo: str, action: str = "发言") -> str:
+        """本轮是否已经用 qq_dive 收尾。收尾后返回拒绝理由，否则空串。
+
+        qq_dive 的意思是「本轮结束」，但工具调用并不会真的终止 Agent 循环——模型收尾后
+        仍然能继续调工具。旧版不拦，于是出现「已经收尾、紧接着又发两条」，用户看到的就是
+        同一句话被回复两次以上。这里把收尾之后的发言/等待直接拦掉。
+        """
+        if not (umo and self._dived_this_turn.get(umo)):
+            return ""
+        self._after_dive_blocks += 1
+        logger.info(f"[qq-bridge] 本轮已收尾（qq_dive），拦下收尾后的{action}调用：{umo}")
+        return (
+            f"本轮已经用 qq_dive 收尾了，这个{action}不会生效。本轮到此结束，"
+            f"要补充内容请等下一轮，现在直接给出结束语即可。"
+        )
+
+    def _mark_seen(self, umo: str, *seqs: int) -> None:
+        """把「模型已经看到过」的水位推到这些序号。
+
+        排队补跑（_drain_pending）就是拿这个水位判断「上一轮是不是已经看到过这条消息」：
+        水位之内跳过补跑，否则同一条消息会被回第二遍。所以**凡是把消息内容交给模型的工具
+        都要在这里登记**——回合开始的快照和 qq_wait_for_messages 早就登记了，
+        qq_get_recent_messages 这类读取工具以前漏了：模型明明用它看到了中途到达的新消息并
+        回了它，水位却停在旧值，回合结束又把那条补跑一轮 → 再回一遍。
+        """
+        if not umo:
+            return
+        top = max((int(x) for x in seqs if x), default=0)
+        if top > self._turn_seen_seq.get(umo, 0):
+            self._turn_seen_seq[umo] = top
+
     def _mark_spoken(self, umo: str) -> None:
         """标记本轮已经发过东西。
 
@@ -1304,6 +1344,9 @@ class QQBridgePlugin(Star):
         umo = self._turn_umo(event)
         if not umo:
             return "拿不到会话信息，操作取消。"
+        closed = self._closed_this_turn(umo, "发言")
+        if closed:
+            return closed
         if not bool(self._cfg("agent.allowSend", True)):
             return "管理员已关闭发言工具。"
 
@@ -1355,7 +1398,10 @@ class QQBridgePlugin(Star):
             self._dived_this_turn[umo] = True
         # 措辞要硬：模型看到「已结束」后若还继续调工具，本轮不会真的结束，
         # 会话锁会一直被占住，这段时间里用户新发的消息只能排队（旧版则直接丢）。
-        return "已收尾，本轮结束。不要再调用任何工具，也不要再发消息，直接给出结束语即可。"
+        return (
+            "已收尾，本轮结束。注意：本轮之后调用的发言/等待工具都会被忽略、不会发出去，"
+            "所以不要再调用任何工具，直接给出结束语即可。"
+        )
 
     @filter.llm_tool(name="qq_wait_for_messages")
     async def qq_wait_for_messages(
@@ -1376,6 +1422,9 @@ class QQBridgePlugin(Star):
         """
         if not self._turn_umo(event):
             return "拿不到会话信息，操作取消。"
+        closed = self._closed_this_turn(self._turn_umo(event), "等待")
+        if closed:
+            return closed
         denied = self._guard(event)
         if denied:
             return denied
@@ -1415,7 +1464,11 @@ class QQBridgePlugin(Star):
         denied = self._guard(event)
         if denied:
             return denied
-        snapshot = self.inbox.snapshot(self._turn_umo(event), limit=max(1, min(int(limit or 20), 100)))
+        umo = self._turn_umo(event)
+        snapshot = self.inbox.snapshot(umo, limit=max(1, min(int(limit or 20), 100)))
+        # 模型已经看到最近的记录了 → 推进「已看过」水位。不推的话，本轮中途到达的新消息
+        # 在回合结束时还会被当成「上一轮没看到」补跑一轮，同一条被回第二遍。
+        self._mark_seen(umo, self.inbox.last_seq(umo))
         return snapshot or "没有可用的历史消息。"
 
     @filter.llm_tool(name="qq_get_active_members")
@@ -1445,6 +1498,7 @@ class QQBridgePlugin(Star):
         record = self.inbox.find(umo, messageId)
         if not record:
             return f"找不到消息 {messageId}（只能用本会话收到过的 id）。"
+        self._mark_seen(umo, record.seq)  # 看过这条了，别再为它补跑
         urls = [u for u in record.images if u]
         if not urls:
             return "这条消息里没有可取的图片。"
@@ -1468,11 +1522,13 @@ class QQBridgePlugin(Star):
         Args:
             messageId(string): 转发消息的 id，从消息快照里的 [转发消息 id=...] 取。
         """
-        if not self._turn_umo(event):
+        umo = self._turn_umo(event)
+        if not umo:
             return "拿不到会话信息，操作取消。"
-        record = self.inbox.find(self._turn_umo(event), messageId)
+        record = self.inbox.find(umo, messageId)
         if not record or not record.forward_ids:
             return f"找不到转发消息 {messageId}（只查本会话确实收到过的 id）。"
+        self._mark_seen(umo, record.seq)
         return (
             "转发消息 id="
             + ",".join(record.forward_ids)
@@ -1492,6 +1548,9 @@ class QQBridgePlugin(Star):
         umo = self._turn_umo(event)
         if not umo:
             return "拿不到会话信息，操作取消。"
+        closed = self._closed_this_turn(umo, "拍一拍")
+        if closed:
+            return closed
         denied = self._guard(event)
         if denied:
             return denied
@@ -1538,6 +1597,9 @@ class QQBridgePlugin(Star):
         umo = self._turn_umo(event)
         if not umo:
             return "拿不到会话信息，操作取消。"
+        closed = self._closed_this_turn(umo, "发表情")
+        if closed:
+            return closed
         denied = self._guard(event)
         if denied:
             return denied
@@ -1627,6 +1689,9 @@ class QQBridgePlugin(Star):
         umo = self._turn_umo(event)
         if not umo:
             return "拿不到会话信息，操作取消。"
+        closed = self._closed_this_turn(umo, "发语音")
+        if closed:
+            return closed
         denied = self._guard(event)
         if denied:
             return denied
