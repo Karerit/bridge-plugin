@@ -722,8 +722,9 @@ class QQBridgePlugin(Star):
                 await asyncio.sleep(delay)
             components = [*head, Plain(text=part)] if index == 0 else [Plain(text=part)]
             ok = await self._send_chain(event, target, MessageChain(chain=components)) and ok
-        if event is not None:
-            self._sent_this_turn[event.unified_msg_origin] = True
+        # 无论是用户回合还是主动回合，发了文本就标记——否则主动回合兜底会把思考再发一条。
+        if target:
+            self._sent_this_turn[target] = True
         return ok
 
     # ══════════════════════════════════════════════════════════════════════════
@@ -874,6 +875,10 @@ class QQBridgePlugin(Star):
         provider_id = await self._provider_id(umo)
         if not provider_id:
             return
+        # 每次主动回合开始前重置发言/潜水标记——不重置的话，上一轮残留为 True 会让本轮
+        # 兜底判定失效，模型没说话也不会被兜底发出。
+        self._sent_this_turn[umo] = False
+        self._dived_this_turn[umo] = False
         snapshot, seen_now = self.inbox.render(
             self.inbox.recent(umo, limit=int(self._cfg("context.snapshotLimit", 20) or 20)),
             new_after_seq=self._turn_seen_seq.get(umo, 0),
@@ -894,6 +899,7 @@ class QQBridgePlugin(Star):
         token = _CURRENT_UMO.set(umo)
         self._last_umo = umo
         started = time.time()
+        resp = None
         try:
             resp = await self.context.tool_loop_agent(
                 event=None,
@@ -906,12 +912,26 @@ class QQBridgePlugin(Star):
             )
         except Exception as exc:
             logger.warning(f"[qq-bridge] 主动回合失败：{exc}")
-            # 主动回合同样要记账，否则这部分 token 在面板上完全不存在
             await self._record_usage(umo=umo, provider_id=provider_id, resp=None, started=started, status="error")
         else:
             await self._record_usage(umo=umo, provider_id=provider_id, resp=resp, started=started)
         finally:
             _CURRENT_UMO.reset(token)
+
+        # 兜底：和用户回合保持一致——模型既没发言也没 dive 时，把思考文本发出去。
+        # 主动回合也要走这步，否则「模型没调用工具也没报错」时会表现为完全没反应。
+        if (
+            resp is not None
+            and bool(self._cfg("agent.fallbackSendThinking", True))
+            and not self._sent_this_turn.get(umo)
+            and not self._dived_this_turn.get(umo)
+        ):
+            thinking = clean_model_text(
+                getattr(resp, "completion_text", "") or "",
+                int(self._cfg("reply.maxChars", 500) or 500),
+            ).strip()
+            if thinking:
+                await self._send_text(None, thinking, umo=umo)
 
     async def _slang_loop(self) -> None:
         """定期从最近的群聊记录里抽黑话候选。"""
@@ -1416,17 +1436,23 @@ class QQBridgePlugin(Star):
         Args:
             messageId(string): 消息 id，从消息快照里取。
         """
-        if not self._turn_umo(event):
+        umo = self._turn_umo(event)
+        if not umo:
             return "拿不到会话信息，操作取消。"
-        record = self.inbox.find(self._turn_umo(event), messageId)
+        record = self.inbox.find(umo, messageId)
         if not record:
             return f"找不到消息 {messageId}（只能用本会话收到过的 id）。"
         urls = [u for u in record.images if u]
         if not urls:
             return "这条消息里没有可取的图片。"
+        # 主动回合（event=None）没有 event.send 可用，只能返回 URL 让模型自己"看"描述
+        if event is None:
+            preview = "\n".join(f"- {u}" for u in urls[:3])
+            return f"图片 URL（主动回合无法直接送进上下文，按链接自行判断）：\n{preview}"
+        from astrbot.api.event import MessageChain
         for url in urls[:3]:
             try:
-                chain = MessageChainWithImage(url)
+                chain = MessageChain(chain=[Image.fromURL(url)])
                 await event.send(chain)
             except Exception as exc:
                 return f"取图失败：{exc}"
@@ -1460,17 +1486,27 @@ class QQBridgePlugin(Star):
         from astrbot.api.event import MessageChain
         from astrbot.api.message_components import Poke
 
-        if not self._turn_umo(event):
+        umo = self._turn_umo(event)
+        if not umo:
             return "拿不到会话信息，操作取消。"
         denied = self._guard(event)
         if denied:
             return denied
-        target = str(targetUserId or event.get_sender_id() or "")
+        # 主动回合没有 event.get_sender_id()，必须显式传 targetUserId
+        if event is not None:
+            target = str(targetUserId or event.get_sender_id() or "")
+        else:
+            target = str(targetUserId or "")
         if not target:
-            return "拿不到要拍的 QQ 号。"
+            return (
+                "拿不到要拍的 QQ 号（主动回合必须显式传 targetUserId，不能默认拍对方）。"
+                if event is None
+                else "拿不到要拍的 QQ 号。"
+            )
         try:
-            await event.send(MessageChain(chain=[Poke(id=target)]))
-            self._mark_spoken(self._turn_umo(event))
+            chain = MessageChain(chain=[Poke(id=target)])
+            await self._send_chain(event, umo, chain)
+            self._mark_spoken(umo)
             return "已拍一拍。"
         except Exception as exc:
             return f"拍一拍失败：{exc}"
@@ -1496,7 +1532,8 @@ class QQBridgePlugin(Star):
         """
         from astrbot.api.event import MessageChain
 
-        if not self._turn_umo(event):
+        umo = self._turn_umo(event)
+        if not umo:
             return "拿不到会话信息，操作取消。"
         denied = self._guard(event)
         if denied:
@@ -1511,10 +1548,10 @@ class QQBridgePlugin(Star):
                 chain = MessageChain(chain=[Image.fromURL(entry["url"])])
             else:
                 chain = MessageChain(chain=[Image.fromFileSystem(entry["path"])])
-            await event.send(chain)
+            await self._send_chain(event, umo, chain)
         except Exception as exc:
             return f"发送失败：{exc}"
-        self._mark_spoken(self._turn_umo(event))
+        self._mark_spoken(umo)
         self.stickers.mark_used(stickerId)
         self.stickers.save()
         return "已发送表情。"
@@ -1584,7 +1621,8 @@ class QQBridgePlugin(Star):
         from astrbot.api.event import MessageChain
         from astrbot.api.message_components import Record  # noqa: F401  （fromFileSystem 用到）
 
-        if not self._turn_umo(event):
+        umo = self._turn_umo(event)
+        if not umo:
             return "拿不到会话信息，操作取消。"
         denied = self._guard(event)
         if denied:
@@ -1601,10 +1639,11 @@ class QQBridgePlugin(Star):
         if not allowed:
             return reason
         try:
-            await event.send(MessageChain(chain=[Record.fromFileSystem(item["path"])]))
+            chain = MessageChain(chain=[Record.fromFileSystem(item["path"])])
+            await self._send_chain(event, umo, chain)
         except Exception as exc:
             return f"发送失败：{exc}"
-        self._mark_spoken(self._turn_umo(event))
+        self._mark_spoken(umo)
         self.voice_limiter.mark()
         return "已发送语音。" + (f"（{hint}）" if hint else "")
 
