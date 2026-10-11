@@ -24,7 +24,7 @@ import json
 import logging
 from pathlib import Path
 from typing import Callable
-from urllib.parse import parse_qs, urlsplit
+from urllib.parse import parse_qs, quote, unquote, unquote_plus, urlsplit
 
 logger = logging.getLogger("astrbot_plugin_qq_bridge")
 
@@ -107,7 +107,8 @@ class MemoryView:
         host = self.host
         if host in ("0.0.0.0", "::", ""):
             host = "127.0.0.1"
-        query = f"?token={self.token}" if (token and self.token) else ""
+        # token 必须做 URL 编码：含 + & # 空格时，原样拼出来的地址会指向错误的令牌
+        query = f"?token={quote(self.token, safe='')}" if (token and self.token) else ""
         return f"http://{host}:{self.port}/{query}"
 
     async def start(self) -> bool:
@@ -130,8 +131,14 @@ class MemoryView:
             return False
         self.last_error = ""
         logger.info(
-            f"[qq-bridge] 记忆查看页已启动：{self.url()}"
+            f"[qq-bridge] 记忆查看页已启动：{self.url(token=False)}"
             f"（{'允许删除' if self.allow_delete else '只读'}）"
+            + (
+                "（已启用访问令牌：首次访问请在网址后加 ?token=你的令牌，"
+                "之后浏览器会用 cookie 记住）"
+                if self.token
+                else ""
+            )
         )
         return True
 
@@ -213,8 +220,17 @@ class MemoryView:
         path = (split.path or "/").rstrip("/") or "/"
         query = parse_qs(split.query)
 
-        if self.token and not self._authorized(query, headers):
-            await self._send(writer, 401, "text/plain; charset=utf-8", "需要 token。".encode())
+        if self.token and not self._authorized(query, headers, split.query):
+            await self._send(
+                writer,
+                401,
+                "text/plain; charset=utf-8",
+                (
+                    "需要 token：请在网址后加 ?token=你的访问令牌"
+                    "（插件配置里的「记忆查看页 - 访问令牌」），"
+                    "或带上 X-QQBridge-Token 请求头。"
+                ).encode(),
+            )
             return
 
         if path == "/" or path == "/index.html":
@@ -293,16 +309,49 @@ class MemoryView:
                 f"容器或 WSL 里只监听 127.0.0.1 是访问不到的"
             )
 
-    def _authorized(self, query: dict, headers: dict) -> bool:
-        given = (query.get("token") or [""])[0] or headers.get("x-qqbridge-token", "")
-        if not given:
-            cookie = headers.get("cookie", "")
-            for chunk in cookie.split(";"):
-                name, _, value = chunk.strip().partition("=")
-                if name == "qqbridge_token":
-                    given = value
-                    break
-        return bool(given) and hmac.compare_digest(str(given), self.token)
+    @staticmethod
+    def _raw_query_tokens(raw_query: str) -> list[str]:
+        """从原始 query 里取 token 的原样值（不做 URL 解码）。
+
+        手工在地址栏敲 ``?token=a+b`` 时，``+`` 不会被解码成空格；地址里带 ``&`` 时
+        还会被当成参数分隔符。所以除了标准解析结果，再把「原样值」和「token= 之后的整段」
+        也作为候选，避免用户复制令牌后因为这几个字符而登录不上。
+        """
+        out: list[str] = []
+        raw = raw_query or ""
+        for chunk in raw.split("&"):
+            name, sep, value = chunk.partition("=")
+            if sep and unquote_plus(name) == "token" and value:
+                out.append(value)
+        _, sep, rest = raw.partition("=")
+        if sep and unquote_plus(raw.split("=", 1)[0]) == "token" and rest:
+            out.append(rest)
+        return out
+
+    def _authorized(self, query: dict, headers: dict, raw_query: str = "") -> bool:
+        """校验访问令牌。三种携带方式都认：``?token=``、``X-QQBridge-Token`` 头、cookie。
+
+        比较时做三件事，都是为了「用户复制同一个令牌却登录不上」这类问题：
+          · 两侧都去掉首尾空白（从配置里粘贴很容易带上空格，而配置侧本来就会 strip）；
+          · 除标准解析结果外，再比对 URL 原样值（见 ``_raw_query_tokens``）；
+          · 用 UTF-8 字节比较——``hmac.compare_digest`` 对含非 ASCII 的 str 会直接抛
+            TypeError，中文令牌会让页面报 500 而不是正常鉴权。
+        """
+        candidates: list[str] = [str(v) for v in (query.get("token") or [])]
+        candidates += self._raw_query_tokens(raw_query)
+        candidates.append(headers.get("x-qqbridge-token", ""))
+        for chunk in headers.get("cookie", "").split(";"):
+            name, _, value = chunk.strip().partition("=")
+            if name == "qqbridge_token" and value:
+                candidates.append(value)
+                candidates.append(unquote(value))
+        want = self.token.encode("utf-8")
+        for given in candidates:
+            if not given:
+                continue
+            if hmac.compare_digest(given.strip().encode("utf-8"), want):
+                return True
+        return False
 
     async def _send_html(self, writer: asyncio.StreamWriter) -> None:
         html = ""
@@ -313,9 +362,20 @@ class MemoryView:
                 logger.debug(f"[qq-bridge] 读记忆查看页失败：{exc}")
         if not html:
             html = "<!doctype html><meta charset='utf-8'><h3>记忆查看页文件缺失</h3>"
-        # 页面里用 __QQBRIDGE_TOKEN__ 占位，服务端替换，避免把 token 拼进前端脚本
-        html = html.replace("__QQBRIDGE_TOKEN__", self.token)
-        await self._send(writer, 200, "text/html; charset=utf-8", html.encode("utf-8"))
+        # 页面里占位符是带引号的 "\"__QQBRIDGE_TOKEN__\""，服务端替换成 JSON 字符串字面量：
+        # 用 json.dumps 而不是裸拼，令牌里含引号/反斜杠时才不会把前端脚本写坏。
+        html = html.replace('"__QQBRIDGE_TOKEN__"', json.dumps(self.token))
+        extra = {}
+        if self.token:
+            # 顺手写个 cookie：这样页面里的取数请求（/api/memory）不用再靠前端拼 ?token=，
+            # 浏览器会自己带上——「首页能开、数据读不出来」多半就是卡在这一步。
+            extra["Set-Cookie"] = (
+                f"qqbridge_token={quote(self.token, safe='')}; "
+                "Path=/; HttpOnly; SameSite=Strict; Max-Age=2592000"
+            )
+        await self._send(
+            writer, 200, "text/html; charset=utf-8", html.encode("utf-8"), extra or None
+        )
 
     async def _send_json(self, writer: asyncio.StreamWriter, data: dict, status: int = 200) -> None:
         await self._send(

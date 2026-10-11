@@ -1059,6 +1059,9 @@ class QQBridgePlugin(Star):
     def _memview_status(self) -> str:
         if self.memview.running:
             line = f"已启动 {self.memview.url(token=False)}"
+            if self.memview.token:
+                # 不回显令牌本身，只说清「要带令牌、带一次就行」
+                line += "（已启用访问令牌：首次访问请在网址后加 ?token=你的令牌，之后浏览器会记住）"
             if is_loopback(self.memview.host):
                 # 只监听回环时，AstrBot 若在容器/WSL 里，宿主机浏览器是访问不到的
                 line += "（只监听本机回环；AstrBot 跑在容器/WSL 里时宿主机浏览器连不上）"

@@ -125,7 +125,10 @@
 
       function apiUrl(path) {
         const url = new URL(path, location.origin);
-        if (TOKEN && TOKEN !== "__QQBRIDGE_TOKEN__") url.searchParams.set("token", TOKEN);
+        // 注意：上面那行的占位符会被服务端替换成真实令牌，所以这里只能用前缀判断。
+        // 早先这里拿占位符本身做比较，它同样被替换成令牌后判断恒为假 ——
+        // 令牌永远不会被拼进取数请求，页面就报「读取失败：需要 token」。
+        if (TOKEN && !TOKEN.startsWith("__QQBRIDGE")) url.searchParams.set("token", TOKEN);
         return url;
       }
 
