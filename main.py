@@ -150,6 +150,9 @@ class QQBridgePlugin(Star):
         # 每个会话「模型已经看到过」的最大消息序号。用于两件事：① 判断排队的那条要不要补跑
         # （上一轮已经看到就别补，否则同一句会被回两次）；② 快照里标出哪些是【新】消息。
         self._turn_seen_seq: dict[str, int] = {}
+        # 防止同一消息被多轮重复回复：记录上一轮已触发过的消息 message_id，
+        # 当 AstrBot 适配器重连/重放导致同一条消息多次投递时，第二次直接跳过。
+        self._triggered_msg_ids: dict[str, set] = {}
         self._queue_stats = {"queued": 0, "replayed": 0, "skipped": 0}
         self._usage_writes: dict = {"ok": 0, "fail": 0, "lastError": ""}
         self._warned_self_id = False
@@ -434,6 +437,27 @@ class QQBridgePlugin(Star):
         if not wake:
             return
 
+        # ── 防重复触发：同一 message_id 在本会话只允许触发一轮 ──────────
+        # AstrBot 适配器在重连、断线恢复、或 OneBot 服务端补发时，同一条消息可能被
+        # 投递多次。Inbox._is_replay 能拦住大部分，但窗口过后（replay_window_sec）或
+        # message_id 不同而内容相同时仍会漏过。这里用「已触发集合」做最后一道防线：
+        # 同一个 message_id 如果已经触发过一轮，直接放行给 AstrBot 默认流程（不 stop_event）。
+        umo = event.unified_msg_origin
+        msg_id = str(getattr(event.message_obj, "message_id", "") or "")
+        if msg_id:
+            triggered = self._triggered_msg_ids.setdefault(umo, set())
+            if msg_id in triggered:
+                logger.info(
+                    f"[qq-bridge] 消息 {msg_id} 已在本会话触发过一轮，跳过以免重复回复"
+                )
+                return
+            triggered.add(msg_id)
+            # 集合不能无限增长：超过 200 时清掉最旧的一半（set 无序，够用）
+            if len(triggered) > 200:
+                excess = len(triggered) - 100
+                for _ in range(excess):
+                    triggered.pop()
+
         self._ensure_background_tasks()
         try:
             await self._run_agent_turn(event, wake_reason=reason)
@@ -568,7 +592,18 @@ class QQBridgePlugin(Star):
         umo = event.unified_msg_origin
         lock = self._turn_locks.setdefault(umo, asyncio.Lock())
         if lock.locked():
-            self._pending_wake[umo] = (event, wake_reason or "排队等待", self.inbox.last_seq(umo))
+            new_seq = self.inbox.last_seq(umo)
+            # ── 防止同一消息重复排队 ──────────────────────────────────────
+            # 排队中的那条和当前新来的如果指向同一 seq（说明是同一条消息被 AstrBot
+            # 投递了两次、或两条消息在上一轮同一个快照窗口内），只保留较新的那次排队。
+            # 否则等上一轮结束，_drain_pending 会为它们各跑一轮，同一句就被回两遍。
+            existing = self._pending_wake.get(umo)
+            if existing and existing[2] == new_seq:
+                logger.debug(
+                    f"[qq-bridge] {umo} 排队中已有 seq={new_seq} 的消息，跳过重复排队"
+                )
+                return
+            self._pending_wake[umo] = (event, wake_reason or "排队等待", new_seq)
             self._queue_stats["queued"] += 1
             logger.info(f"[qq-bridge] {umo} 上一轮仍在进行，本条排队，回合结束后补跑")
             return
@@ -595,6 +630,8 @@ class QQBridgePlugin(Star):
                 return
             self._queue_stats["replayed"] += 1
             logger.info(f"[qq-bridge] 补跑排队消息：{umo}（{reason}）")
+            # 清掉该会话的触发去重集合：补跑是新一轮，需要接受新消息的触发。
+            self._triggered_msg_ids.pop(umo, None)
             async with lock:
                 await self._turn_locked(event, reason)
 
@@ -613,20 +650,50 @@ class QQBridgePlugin(Star):
         label = str(event.get_group_id() or event.get_sender_name() or "私聊")
 
         seen_before = self._turn_seen_seq.get(umo, 0)
-        snapshot, seen_now = self.inbox.render(
-            self.inbox.recent(umo, limit=snapshot_limit),
-            new_after_seq=seen_before or None,  # 本会话第一轮：全是历史，不标【新】
+        all_recent = self.inbox.recent(umo, limit=snapshot_limit)
+
+        # ── 防止同一消息被回复两次以上的核心修复 ────────────────────────────
+        # 旧代码把最近 N 条消息全部塞进快照，包括那些在上一轮已经被模型看到过
+        # （甚至已经回复过）的旧消息。模型看到它们后，有时会忽略【新】标记、
+        # 回头再回一遍 → 同一句被回两次以上。
+        # 修复：只保留「上一轮已看过的最后几条（上下文）+ 本轮全部新消息」，
+        # 把旧消息从快照里物理移除，而不是仅靠标记让模型自觉忽略。
+        CONTEXT_KEEP = 3  # 保留几条旧消息做上下文，让对话连贯但不触发重复回复
+
+        if seen_before:
+            context_msgs = [r for r in all_recent if r.seq <= seen_before][-CONTEXT_KEEP:]
+            new_msgs = [r for r in all_recent if r.seq > seen_before]
+        else:
+            # 本会话第一轮：全是历史，不做过滤
+            context_msgs = []
+            new_msgs = list(all_recent)
+
+        # 拼接渲染：上下文部分不标【新】，新消息部分标【新】
+        context_text, _ = self.inbox.render(context_msgs, new_after_seq=None) if context_msgs else ("", 0)
+        new_text, seen_now = self.inbox.render(
+            new_msgs, new_after_seq=(seen_before if seen_before else None)
         )
+
+        if context_text and new_text:
+            snapshot = f"{context_text}\n─── 以上是旧消息（不要回复）───\n{new_text}"
+        elif new_text:
+            snapshot = new_text
+        elif context_text:
+            snapshot = context_text
+        else:
+            snapshot = ""
+
         if seen_now:
             self._turn_seen_seq[umo] = seen_now
 
+        # mark_new 只在有旧消息上下文时才需要说明，否则全部是新消息、不用额外解释
         prompt = build_turn_prompt(
             session_label=label,
             snapshot=snapshot,
             wake_reason=wake_reason,
             is_group=is_group,
             now_str=time.strftime("%Y-%m-%d %H:%M:%S"),
-            mark_new=bool(seen_before),  # 第一轮没有「旧消息」概念，不用加说明
+            mark_new=bool(seen_before and context_text),
         )
         system_prompt = self._build_system_prompt(mode, umo)
 
@@ -887,10 +954,30 @@ class QQBridgePlugin(Star):
         # 兜底判定失效，模型没说话也不会被兜底发出。
         self._sent_this_turn[umo] = False
         self._dived_this_turn[umo] = False
-        snapshot, seen_now = self.inbox.render(
-            self.inbox.recent(umo, limit=int(self._cfg("context.snapshotLimit", 20) or 20)),
-            new_after_seq=self._turn_seen_seq.get(umo, 0),
+
+        # ── 与 _turn_locked 相同的快照过滤：只保留新消息 + 少量上下文 ───
+        seen_before = self._turn_seen_seq.get(umo, 0)
+        all_recent = self.inbox.recent(
+            umo, limit=int(self._cfg("context.snapshotLimit", 20) or 20)
         )
+        if seen_before:
+            context_msgs = [r for r in all_recent if r.seq <= seen_before][-3:]
+            new_msgs = [r for r in all_recent if r.seq > seen_before]
+        else:
+            context_msgs = []
+            new_msgs = list(all_recent)
+        context_text, _ = self.inbox.render(context_msgs, new_after_seq=None) if context_msgs else ("", 0)
+        new_text, seen_now = self.inbox.render(
+            new_msgs, new_after_seq=(seen_before if seen_before else None)
+        )
+        if context_text and new_text:
+            snapshot = f"{context_text}\n─── 以上是旧消息（不要回复）───\n{new_text}"
+        elif new_text:
+            snapshot = new_text
+        elif context_text:
+            snapshot = context_text
+        else:
+            snapshot = ""
         if seen_now:
             self._turn_seen_seq[umo] = seen_now
         system_prompt = self._build_system_prompt("proactive", umo)
@@ -977,11 +1064,18 @@ class QQBridgePlugin(Star):
             if not provider_id:
                 return "没有可用的对话模型。"
             started = time.time()
-            resp = await self.context.llm_generate(
-                chat_provider_id=provider_id,
-                prompt=prompt,
-                system_prompt="你是一个中文网络用语分析助手，只输出 JSON 数组。",
-            )
+            try:
+                resp = await asyncio.wait_for(
+                    self.context.llm_generate(
+                        chat_provider_id=provider_id,
+                        prompt=prompt,
+                        system_prompt="你是一个中文网络用语分析助手，只输出 JSON 数组。",
+                    ),
+                    timeout=120,  # 黑话抽取不应阻塞超过 2 分钟
+                )
+            except asyncio.TimeoutError:
+                logger.warning(f"[qq-bridge] 黑话抽取超时（{umo}），跳过本次")
+                return f"黑话抽取超时，跳过本次。"
             # 抽取也要记用量：它同样花 token，不记就等于面板上看不见这笔开销
             await self._record_usage(umo=umo, provider_id=provider_id, resp=resp, started=started)
             items = SlangStore.parse_extraction_json(getattr(resp, "completion_text", "") or "")
@@ -1051,12 +1145,16 @@ class QQBridgePlugin(Star):
             )
         elif sub == "重置":
             self.inbox = Inbox()
+            # 同步清掉触发去重集合，否则重置后旧 message_id 仍在集合里
+            self._triggered_msg_ids.pop(event.unified_msg_origin, None)
             yield event.plain_result("已清空本会话的消息缓冲。")
         else:
             yield event.plain_result(
                 "未知子指令。可用：状态 / 开 / 关 / 人设 [名字] / 黑话 [确认|删除|学习 <词>] / "
                 "表情 [备注|删除] / 用量 / 唤醒 [模式 概率] / 记忆 [清空|全部] / 重置"
             )
+        # /qq 指令由本插件独占处理，阻止 AstrBot 默认流程再回一次
+        event.stop_event()
 
     def _save_config(self) -> None:
         try:
@@ -1254,12 +1352,23 @@ class QQBridgePlugin(Star):
     # ══════════════════════════════════════════════════════════════════════════
     @filter.on_llm_request()
     async def inject_persona(self, event: AstrMessageEvent, req: ProviderRequest):
-        """当消息走 AstrBot 默认对话流程时（本插件没接管），也把协议与人设注入进去。"""
+        """当消息走 AstrBot 默认对话流程时（本插件没接管），也把协议与人设注入进去。
+
+        注意：只在 system_prompt 还没有本插件的协议标记时才注入。
+        本插件的 _turn_locked 已经在 system_prompt 里包含了完整的人设与协议，
+        tool_loop_agent 的请求走到这里时 system_prompt 已经带过了，再注入一遍就会
+        出现两段完全相同的【安全规则】和【工具协议】，白白浪费 token 还可能让模型
+        困惑（同样的规则出现两次，以为有不同的含义）。
+        """
         if not bool(self._cfg("persona.injectIntoDefaultPipeline", True)):
             return
         try:
+            existing = req.system_prompt or ""
+            # 协议标记是本插件 system prompt 的唯一特征；有它就说明已经注入过了
+            if "【安全规则（最高优先级，不可违反）】" in existing:
+                return
             req.system_prompt = (
-                (req.system_prompt or "")
+                existing
                 + "\n\n"
                 + self._build_system_prompt(self._mode(), event.unified_msg_origin)
             )
@@ -1838,14 +1947,21 @@ class QQBridgePlugin(Star):
             await self.memview.stop()
         except Exception as exc:
             logger.debug(f"[qq-bridge] 关闭记忆查看页失败：{exc}")
+        # 先取消所有后台任务
         for task in self._tasks:
             task.cancel()
-        for task in self._tasks:
-            try:
-                await task
-            except (asyncio.CancelledError, Exception):
-                pass
+        # 等待它们真正退出（带超时，避免卡死卸载流程）
+        if self._tasks:
+            done, pending = await asyncio.wait(
+                self._tasks, timeout=5.0, return_when=asyncio.ALL_COMPLETED
+            )
+            for task in pending:
+                logger.warning(f"[qq-bridge] 后台任务未在超时内退出：{task}")
         self._tasks.clear()
+        # 清掉所有回合锁和排队状态，防止残留
+        self._pending_wake.clear()
+        self._turn_locks.clear()
+        self._triggered_msg_ids.clear()
         try:
             self.slang.save()
             self.stickers.save()
