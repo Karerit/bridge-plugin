@@ -160,6 +160,12 @@
         "description": "允许 AI 主动发言",
         "type": "bool",
         "default": true
+      },
+      "errorMessage": {
+        "description": "模型调用超时或失败时发送给用户的提示消息",
+        "type": "text",
+        "default": "",
+        "hint": "留空则不发送任何消息（旧行为）。建议设置一条简短的提示，例如「脑子转不动了，等一下再试试？」或「出了点小问题，稍后再试」。"
       }
     }
   },

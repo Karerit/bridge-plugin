@@ -726,6 +726,12 @@ class QQBridgePlugin(Star):
                 started=started,
                 status="error",
             )
+            # ── 模型调用失败时给用户发一条提示 ─────────────────────────
+            # 旧版直接 return，用户看到的就是机器人毫无反应。现在可配一条默认消息，
+            # 让管理员自定义超时/失败时该说什么（空串=不发，保持旧行为）。
+            error_msg = str(self._cfg("agent.errorMessage", "") or "").strip()
+            if error_msg:
+                await self._send_text(event, error_msg)
             return
         finally:
             elapsed = time.time() - started
