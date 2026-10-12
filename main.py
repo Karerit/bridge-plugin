@@ -582,6 +582,32 @@ class QQBridgePlugin(Star):
             self._usage_writes["fail"] += 1
             self._usage_writes["lastError"] = str(result.get("error") or "")
 
+    @staticmethod
+    def _is_error_response(resp) -> bool:
+        """判断 AstrBot 返回的是不是「错误响应」。
+
+        AstrBot 的「所有模型都失败」**不是异常**：``ToolLoopAgentRunner`` 在候选
+        provider 全部失败后，会 yield 一条 ``LLMResponse(role="err",
+        completion_text="All chat models failed: ...")``，并把它设为 final_llm_resp
+        原样返回给 ``context.tool_loop_agent()``（AstrBot 自己那条内部链路会把它
+        渲染成「LLM 响应错误: …」）。所以只写 ``except`` 是接不住这类失败的——
+        必须额外认 ``role == "err"``，否则这条报错文案会被当成「模型的思考」发出去。
+        """
+        return str(getattr(resp, "role", "") or "").strip().lower() == "err"
+
+    async def _send_model_error(self, event, umo: str = "", detail: str = "") -> bool:
+        """模型调用失败/超时时，发配置里的提示（``agent.errorMessage``，留空=不发）。
+
+        ``detail`` 只进日志，绝不发给用户——群里不该看到 API 报错原文。
+        """
+        if detail:
+            logger.error(f"[qq-bridge] 模型调用失败，改发 agent.errorMessage：{detail}")
+        error_msg = str(self._cfg("agent.errorMessage", "") or "").strip()
+        if not error_msg:
+            logger.warning("[qq-bridge] agent.errorMessage 未配置，本轮不发任何提示")
+            return False
+        return await self._send_text(event, error_msg, umo=umo)
+
     async def _run_agent_turn(self, event: AstrMessageEvent, *, wake_reason: str) -> None:
         """跑一轮 Agent。同一会话串行执行。
 
@@ -729,13 +755,31 @@ class QQBridgePlugin(Star):
             # ── 模型调用失败时给用户发一条提示 ─────────────────────────
             # 旧版直接 return，用户看到的就是机器人毫无反应。现在可配一条默认消息，
             # 让管理员自定义超时/失败时该说什么（空串=不发，保持旧行为）。
-            error_msg = str(self._cfg("agent.errorMessage", "") or "").strip()
-            if error_msg:
-                await self._send_text(event, error_msg)
+            await self._send_model_error(
+                event, umo, detail=f"{type(exc).__name__}: {exc}"
+            )
             return
         finally:
             elapsed = time.time() - started
             _CURRENT_UMO.reset(token)
+
+        # ── 模型「全挂」不会抛异常，而是回一条 role="err" 的响应 ──────────────
+        # 上面那个 except 只接得住真异常；AstrBot 在所有候选 provider 都失败时是把
+        # 错误包成 LLMResponse(role="err", completion_text="All chat models failed: …")
+        # 正常返回的。不在这里拦下来，这条报错就会被下面「把思考当回复」的兜底
+        # 原样发到群里——用户看到的是 API 报错原文，而不是 agent.errorMessage。
+        if self._is_error_response(resp):
+            await self._record_usage(
+                umo=umo,
+                provider_id=provider_id,
+                resp=None,  # 错误响应没有有效用量：token 记 0，状态记 error
+                started=started,
+                status="error",
+            )
+            await self._send_model_error(
+                event, umo, detail=getattr(resp, "completion_text", "") or "未知错误"
+            )
+            return
 
         await self._record_usage(
             umo=umo,
@@ -1015,7 +1059,19 @@ class QQBridgePlugin(Star):
             logger.warning(f"[qq-bridge] 主动回合失败：{exc}")
             await self._record_usage(umo=umo, provider_id=provider_id, resp=None, started=started, status="error")
         else:
-            await self._record_usage(umo=umo, provider_id=provider_id, resp=resp, started=started)
+            # 主动回合也要认 role="err"：它不是「模型说了话」，也不是一次成功调用。
+            # 置空后，下面的兜底发言自然不会把 AstrBot 的报错文案当思考发进群里。
+            if self._is_error_response(resp):
+                logger.warning(
+                    f"[qq-bridge] 主动回合模型返回错误响应（role=err），跳过兜底发言："
+                    f"{getattr(resp, 'completion_text', '') or '未知错误'}"
+                )
+                await self._record_usage(
+                    umo=umo, provider_id=provider_id, resp=None, started=started, status="error"
+                )
+                resp = None
+            else:
+                await self._record_usage(umo=umo, provider_id=provider_id, resp=resp, started=started)
         finally:
             _CURRENT_UMO.reset(token)
 
