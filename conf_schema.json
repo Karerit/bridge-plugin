@@ -166,6 +166,26 @@
         "type": "text",
         "default": "",
         "hint": "留空则不发送任何消息（旧行为）。建议设置一条简短的提示，例如「脑子转不动了，等一下再试试？」或「出了点小问题，稍后再试」。"
+      },
+      "tools": {
+        "description": "工具面：给模型挂哪些工具",
+        "type": "object",
+        "hint": "其它插件的能力大多以 llm_tool 形式注册。只挂本插件自己的 qq_* 工具时，那些能力模型根本看不见，等于插件白装。",
+        "items": {
+          "mode": {
+            "description": "工具范围",
+            "type": "string",
+            "default": "all",
+            "options": ["all", "own"],
+            "labels": ["全部已启用工具（兼容其它插件）", "只挂本插件的 qq_* 工具（旧行为）"]
+          },
+          "exclude": {
+            "description": "不挂给模型的工具名",
+            "type": "list",
+            "default": [],
+            "hint": "按工具名精确排除，例如 [\"astrbot_execute_shell\"]。只影响本插件发起的回合。"
+          }
+        }
       }
     }
   },
@@ -391,6 +411,31 @@
         "description": "允许在页面上删除记忆",
         "type": "bool",
         "default": false
+      }
+    }
+  },
+  "compat": {
+    "description": "与其它 AstrBot 插件的兼容",
+    "type": "object",
+    "hint": "本插件自己接管了整轮对话，默认会把 AstrBot 的标准扩展点重新接回去：请求注入（on_llm_request）、回复解析（on_llm_response）、发送前装饰（on_decorating_result）。关掉对应项可回到旧行为。",
+    "items": {
+      "enabled": {
+        "description": "启用兼容层总开关",
+        "type": "bool",
+        "default": true,
+        "hint": "关闭后下面三项全部失效，回到 0.2.0 的独占行为（其它插件完全不参与）"
+      },
+      "hooks": {
+        "description": "让其它插件参与本轮的请求与回复",
+        "type": "bool",
+        "default": true,
+        "hint": "触发 on_llm_request（注入提示词/动态数据、拦截消息）与 on_llm_response（解析模型回复）。好感度、记忆增强这类插件依赖它。"
+      },
+      "decorate": {
+        "description": "发送前让其它插件改写消息链",
+        "type": "bool",
+        "default": true,
+        "hint": "触发 on_decorating_result。插件靠它摘掉控制标签（如 [好感度 上升：3]）、加后缀、转图片。关掉的话这些标签会原样发到群里。"
       }
     }
   }

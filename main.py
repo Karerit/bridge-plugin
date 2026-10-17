@@ -13,10 +13,23 @@
                                                  （qbridge/usage.py，写入 provider_stats）
     管理员看记忆   原项目无                   →  自带一个小页面（qbridge/memview.py，默认 8899）
 
-行为设计的关键取舍：**由插件独占本轮对话**。收到消息后插件自己调
-``context.tool_loop_agent()``，模型的文本输出按原项目约定只算「思考」不直接发出，
-发言必须走 qq_send_message 等工具；最后 event.stop_event() 阻止 AstrBot 默认的
-对话流程再回一次，避免重复发言。这样才保留了原项目「AI 自主决定说不说话」的语义。
+行为设计的关键取舍：**插件主导本轮，但把 AstrBot 的标准扩展点接回去**。
+收到消息后插件自己调 ``context.tool_loop_agent()``，模型的文本输出按原项目约定只算
+「思考」不直接发出，发言必须走 qq_send_message 等工具；这样才保留了原项目
+「AI 自主决定说不说话」的语义。
+
+只做「自己跑一轮」是不够的：早期版本还用 ``event.stop_event()`` 独占整条事件、
+只挂自己的 qq_* 工具、发言用 ``event.send()`` 裸发送——三条加起来等于把 AstrBot 的
+插件生态整条切断（其它插件的提示词注入、回复解析、发送前装饰全部失效）。
+现在改为：
+
+  · 本轮请求先过 ``on_llm_request``（其它插件可以注入提示词、拦下消息）；
+  · 模型真正说出去的话以 ``on_llm_response`` 的形式交给其它插件解析；
+  · 发言前把消息链过一遍 ``on_decorating_result``，再按条发出；
+  · 工具集默认挂上全部已启用工具；
+  · 用 ``should_call_llm(True)`` 代替 ``stop_event()`` 压住默认对话流程。
+
+具体实现见 ``qbridge/compat.py``。
 """
 
 from __future__ import annotations
@@ -55,6 +68,13 @@ try:  # AstrBot 以包方式加载插件（data.plugins.<name>.main），相对�
         resolve_db,
     )
     from .qbridge.voice import VoiceLimiter, check_voice_limits, list_voices, resolve_voice
+    from .qbridge.compat import (
+        BridgeAgentHooks,
+        collect_tool_set,
+        decorate_outgoing,
+        fire_llm_request,
+        fire_llm_response,
+    )
 except ImportError:  # 兜底：万一被当作顶层模块加载
     from qbridge.inbox import Inbox, MsgRecord, looks_like_question, match_names
     from qbridge.memview import MemoryView, is_loopback
@@ -77,6 +97,13 @@ except ImportError:  # 兜底：万一被当作顶层模块加载
         resolve_db,
     )
     from qbridge.voice import VoiceLimiter, check_voice_limits, list_voices, resolve_voice
+    from qbridge.compat import (
+        BridgeAgentHooks,
+        collect_tool_set,
+        decorate_outgoing,
+        fire_llm_request,
+        fire_llm_response,
+    )
 
 PLUGIN_NAME = "astrbot_plugin_qq_bridge"
 
@@ -107,6 +134,36 @@ TOOL_NAMES = (
     "qq_memory_query",
     "qq_token_usage",
 )
+
+
+def _group_chain_for_send(chain: list) -> list[list]:
+    """把一条（可能被插件改写过）的消息链拆成「一条 QQ 消息一组」。
+
+    AstrBot 的发送前钩子是按整条链工作的，而 bridge 要的是「多条气泡」。规则：
+
+    * 每个 Plain 组件单独成为一条消息（保持原来分条的观感）；
+    * 非文本组件（At / Reply / Image …）挂在它前面那条消息上；
+    * 链最前面的 At / Reply 前缀挂到第一条消息上。
+    """
+    groups: list[list] = []
+    head: list = []
+    for comp in chain or []:
+        if isinstance(comp, Plain):
+            if groups:
+                groups.append([comp])
+            else:
+                groups.append(head + [comp])
+                head = []
+        elif groups:
+            groups[-1].append(comp)
+        else:
+            head.append(comp)
+    if head:
+        if groups:
+            groups[-1].extend(head)
+        else:
+            groups.append(head)
+    return [group for group in groups if group]
 
 
 class QQBridgePlugin(Star):
@@ -159,6 +216,8 @@ class QQBridgePlugin(Star):
         self._tasks: list[asyncio.Task] = []
         self._started = False
         self._slang_busy = False
+        # Agent 循环里的阶段 → AstrBot 事件钩子（on_agent_begin / on_using_llm_tool …）
+        self._agent_hooks = BridgeAgentHooks()
 
         logger.info(
             f"[qq-bridge] 已加载｜数据目录 {self.data_dir}｜人设卡 {len(list_role_cards(self.role_dir))} 张"
@@ -426,7 +485,9 @@ class QQBridgePlugin(Star):
             logger.info(
                 f"[qq-bridge] 同一条消息重复投递（id={record.message_id}），本轮跳过以免重复回复"
             )
-            event.stop_event()
+            # 只压住 AstrBot 默认的 LLM 请求，不 stop_event：其它插件的 handler
+            # 仍按自己的逻辑处理（它们各自的去重是它们的事）。
+            self._suppress_default_llm(event)
             return
         if record.is_self or not self._session_allowed(event):
             return
@@ -464,8 +525,11 @@ class QQBridgePlugin(Star):
         except Exception as exc:
             logger.error(f"[qq-bridge] 回合执行失败：{exc}", exc_info=True)
         finally:
-            # 本插件独占本轮：阻止 AstrBot 默认对话流程再回一次
-            event.stop_event()
+            # 本轮已经由本插件跑完：只压住 AstrBot 默认的 LLM 请求，**不再 stop_event**。
+            # stop_event 会让同一事件里后续插件的 handler、以及 ResultDecorateStage
+            # （on_decorating_result 就在这里触发）全部跳过——那正是「和别的插件不兼容」
+            # 的根源。用它换 should_call_llm(True)，同样不会重复发言。
+            self._suppress_default_llm(event)
 
     # ══════════════════════════════════════════════════════════════════════════
     #  Agent 回合
@@ -480,25 +544,51 @@ class QQBridgePlugin(Star):
             logger.warning(f"[qq-bridge] 取当前对话模型失败：{exc}")
             return ""
 
-    def _tool_set(self):
-        """从工具管理器取出本插件注册的工具，组成本轮专用 ToolSet。"""
+    def _tool_set(self, event: AstrMessageEvent | None = None):
+        """组本轮的工具集。
+
+        旧版只挂 ``TOOL_NAMES`` 里的 qq_* 工具，等于把 AstrBot 里其它插件注册的
+        llm_tool 全部对模型隐藏——那些插件自然「无法适配」。现在默认挂**全部已启用
+        工具**（插件工具 + MCP 工具），并按 ``agent.tools.exclude`` 与「本会话启用的
+        插件」做过滤；想回到旧行为把 ``agent.tools.mode`` 设成 ``own``。
+        """
+        return collect_tool_set(
+            self.context,
+            event,
+            TOOL_NAMES,
+            mode=str(self._cfg("agent.tools.mode", "all") or "all"),
+            exclude=self._cfg_list("agent.tools.exclude"),
+        )
+
+    def _build_request(self, event: AstrMessageEvent, prompt: str, system_prompt: str):
+        """组一个标准 ``ProviderRequest``。
+
+        这一步是兼容其它插件的前提：``on_llm_request`` 钩子拿到的是这个对象，
+        它们对 ``system_prompt`` / ``extra_user_content_parts`` / ``func_tool`` 的修改
+        必须能传回给 ``tool_loop_agent``，否则注入了也白注入。
+        """
+        tools = self._tool_set(event)
         try:
-            from astrbot.core.agent.tool import ToolSet
-        except ImportError:
-            return None
-        try:
-            manager = self.context.get_llm_tool_manager()
-        except Exception:
-            return None
-        tools = []
-        for name in TOOL_NAMES:
+            return event.request_llm(
+                prompt=prompt,
+                tool_set=tools,
+                system_prompt=system_prompt,
+            )
+        except TypeError:
+            # 老版本 AstrBot 的 request_llm 没有 tool_set 参数
+            req = event.request_llm(prompt=prompt, system_prompt=system_prompt)
             try:
-                tool = manager.get_func(name)
+                req.func_tool = tools
             except Exception:
-                tool = None
-            if tool is not None:
-                tools.append(tool)
-        return ToolSet(tools=tools) if tools else None
+                pass
+            return req
+        except Exception as exc:
+            logger.warning(f"[qq-bridge] 构造 ProviderRequest 失败，改用裸请求：{exc}")
+            from astrbot.core.provider.entities import ProviderRequest
+
+            return ProviderRequest(
+                prompt=prompt, system_prompt=system_prompt, func_tool=tools
+            )
 
     def _build_system_prompt(self, mode: str, umo: str = "") -> str:
         """组本轮系统提示词。umo 用来取该会话自己的记忆——不传就只剩全局记忆。"""
@@ -606,7 +696,7 @@ class QQBridgePlugin(Star):
         if not error_msg:
             logger.warning("[qq-bridge] agent.errorMessage 未配置，本轮不发任何提示")
             return False
-        return await self._send_text(event, error_msg, umo=umo)
+        return await self._send_text(event, error_msg, umo=umo, as_model_reply=False)
 
     async def _run_agent_turn(self, event: AstrMessageEvent, *, wake_reason: str) -> None:
         """跑一轮 Agent。同一会话串行执行。
@@ -732,14 +822,33 @@ class QQBridgePlugin(Star):
         token = _CURRENT_UMO.set(umo)
         self._last_umo = umo
         try:
+            # ── 让其它插件参与本轮请求 ────────────────────────────────────────
+            # tool_loop_agent 自己不会触发 on_llm_request（AstrBot 只在默认管道里触发），
+            # 所以这里先组好 ProviderRequest 手动触发一次：好感度插件正是靠这个钩子
+            # 把评分规则写进 system_prompt、把当前好感度写进 extra_user_content_parts。
+            req = self._build_request(event, prompt, system_prompt)
+            if self._compat_enabled("hooks") and await fire_llm_request(event, req):
+                # 有插件在请求阶段就拦下了这条消息（冷暴力 / 自动拉黑等）。
+                logger.info(
+                    f"[qq-bridge] 本轮请求被其它插件拦截（{umo}），不再调用模型"
+                )
+                return
+            tools = req.func_tool
+            if not tools:
+                # 有插件把工具集清空了。本插件没有工具就完全没法发言，
+                # 这里退回自己的工具集，宁可少一点兼容也不能让机器人变成哑巴。
+                logger.warning("[qq-bridge] 本轮工具集被清空，退回本插件工具")
+                tools = self._tool_set(event)
             resp = await self.context.tool_loop_agent(
                 event=event,
                 chat_provider_id=provider_id,
-                prompt=prompt,
-                system_prompt=system_prompt,
-                tools=self._tool_set(),
+                prompt=req.prompt or prompt,
+                system_prompt=req.system_prompt,
+                extra_user_content_parts=req.extra_user_content_parts,
+                tools=tools,
                 max_steps=max_steps,
                 tool_call_timeout=max(10, timeout_s),
+                agent_hooks=self._agent_hooks if self._compat_enabled("hooks") else None,
             )
         except Exception as exc:
             logger.error(f"[qq-bridge] 模型调用失败：{exc}", exc_info=True)
@@ -807,6 +916,30 @@ class QQBridgePlugin(Star):
     # ══════════════════════════════════════════════════════════════════════════
     #  发送
     # ══════════════════════════════════════════════════════════════════════════
+    def _suppress_default_llm(self, event: AstrMessageEvent) -> None:
+        """阻止 AstrBot 默认对话流程再回一次，但不终止事件传播。
+
+        ``event.stop_event()`` 是「这条消息到此为止」，会连带跳过其它插件的 handler
+        和结果装饰阶段；``should_call_llm(True)`` 只关掉默认 LLM 请求，正好是
+        「本插件已经自己跑完一轮」需要的语义。
+
+        兼容层被整体关掉（``compat.enabled=false``）时退回旧行为，用 stop_event
+        彻底独占这条消息。
+        """
+        if not bool(self._cfg("compat.enabled", True)):
+            event.stop_event()
+            return
+        try:
+            event.should_call_llm(True)
+        except Exception as exc:
+            logger.debug(f"[qq-bridge] 设置 should_call_llm 失败：{exc}")
+
+    def _compat_enabled(self, key: str) -> bool:
+        """兼容开关：``compat.enabled`` 总闸 + 单项开关，默认全开。"""
+        if not bool(self._cfg("compat.enabled", True)):
+            return False
+        return bool(self._cfg(f"compat.{key}", True))
+
     async def _send_chain(self, event: AstrMessageEvent | None, umo: str, chain) -> bool:
         """发消息。有 event 时走 event.send（计入本会话），否则用主动发送。"""
         try:
@@ -819,38 +952,97 @@ class QQBridgePlugin(Star):
             logger.error(f"[qq-bridge] 发送失败：{exc}")
             return False
 
+    async def _send_batch(
+        self,
+        event: AstrMessageEvent | None,
+        texts: list[str] | str,
+        umo: str = "",
+        prefix: list | None = None,
+        as_model_reply: bool = True,
+    ) -> int:
+        """发一批文本，返回成功发出的条数。
+
+        这一版把「兼容其它插件」的三步都串进来了：
+
+        1. ``on_llm_response``：把**真正要发出去的文本**交给其它插件解析
+           （好感度插件从末行摘 ``[好感度 上升：3]`` 这类标签）；
+        2. ``on_decorating_result``：整批文本合成一条链过一次发送前钩子，
+           插件可以摘标签、加后缀、转图，甚至清空链来阻止发送；
+        3. 再按「一条 QQ 消息一组」拆开发出去。
+
+        为什么要「整批装饰一次」而不是「每条装饰一次」：AstrBot 的语义是
+        「一次 LLM 回复 = 一条结果链 = 一次装饰」，拆成多次会让按 message_id
+        记状态的插件（好感度就是）在第一段就把待写入数据 pop 掉，后面的标签白解析。
+
+        ``prefix`` 里的消息组件（At / Reply）只挂在**第一条**前面——这是 @ 与引用回复
+        真正生效的地方：调用方必须把它们传进来，光构造 chain 不发是没有用的。
+
+        ``as_model_reply=False`` 用于「不是模型说的话」（比如失败提示），这类文本不该
+        进入 ``on_llm_response``，否则解析回复的插件会把系统提示当成模型输出。
+        """
+        from astrbot.api.event import MessageChain
+
+        if isinstance(texts, str):
+            texts = [texts]
+        target = umo or self._turn_umo(event)
+        if not target:
+            return 0
+
+        raw_texts = [str(text or "") for text in texts if str(text or "").strip()]
+        if not raw_texts:
+            return 0
+
+        # 解析用「原话」，发送用「清洗后的文本」：清洗会去 Markdown 并按 maxChars 截断，
+        # 长回复的末行标签可能正好被截掉；先解析再截断，插件才不会漏掉这条标签。
+        if as_model_reply and event is not None and self._compat_enabled("hooks"):
+            await fire_llm_response(event, "\n".join(raw_texts))
+
+        max_chars = int(self._cfg("reply.maxChars", 500) or 500)
+        split_chars = int(self._cfg("reply.splitMaxChars", 4000) or 4000)
+        parts: list[str] = []
+        for text in raw_texts:
+            cleaned = clean_model_text(text, max_chars)
+            if cleaned:
+                parts.extend(split_for_qq(cleaned, split_chars))
+        if not parts:
+            return 0
+
+        chain: list = [*list(prefix or []), Plain(text=parts[0])]
+        chain.extend(Plain(text=part) for part in parts[1:])
+
+        if event is not None and self._compat_enabled("decorate"):
+            # 发送前钩子：摘标签 / 加后缀 / 改消息链都在这里发生
+            chain = await decorate_outgoing(event, chain)
+        if not chain:
+            logger.info("[qq-bridge] 发送前钩子清空了消息链，本条不发")
+            return 0
+
+        delay = max(0, int(self._cfg("reply.sendDelayMs", 300) or 0)) / 1000.0
+        sent = 0
+        for index, group in enumerate(_group_chain_for_send(chain)):
+            if index and delay:
+                await asyncio.sleep(delay)
+            if await self._send_chain(event, target, MessageChain(chain=group)):
+                sent += 1
+        # 无论是用户回合还是主动回合，发了文本就标记——否则主动回合兜底会把思考再发一条。
+        if sent:
+            self._sent_this_turn[target] = True
+        return sent
+
     async def _send_text(
         self,
         event: AstrMessageEvent | None,
         text: str,
         umo: str = "",
         prefix: list | None = None,
+        as_model_reply: bool = True,
     ) -> bool:
-        """发一条文本（过长按 splitMaxChars 分段）。
-
-        ``prefix`` 里的消息组件（At / Reply）只挂在**第一段**前面——这是 @ 与引用回复
-        真正生效的地方：调用方必须把它们传进来，光构造 chain 不发是没有用的。
-        """
-        from astrbot.api.event import MessageChain
-
-        if not text:
-            return False
-        target = umo or self._turn_umo(event)
-        if not target:
-            return False
-        parts = split_for_qq(text, int(self._cfg("reply.splitMaxChars", 4000) or 4000))
-        delay = max(0, int(self._cfg("reply.sendDelayMs", 300) or 0)) / 1000.0
-        head = list(prefix or [])
-        ok = True
-        for index, part in enumerate(parts):
-            if index and delay:
-                await asyncio.sleep(delay)
-            components = [*head, Plain(text=part)] if index == 0 else [Plain(text=part)]
-            ok = await self._send_chain(event, target, MessageChain(chain=components)) and ok
-        # 无论是用户回合还是主动回合，发了文本就标记——否则主动回合兜底会把思考再发一条。
-        if target:
-            self._sent_this_turn[target] = True
-        return ok
+        """发一条文本（过长按 splitMaxChars 分段）。``_send_batch`` 的单条封装。"""
+        return bool(
+            await self._send_batch(
+                event, [text], umo=umo, prefix=prefix, as_model_reply=as_model_reply
+            )
+        )
 
     # ══════════════════════════════════════════════════════════════════════════
     #  记忆
@@ -1137,7 +1329,7 @@ class QQBridgePlugin(Star):
                 )
             except asyncio.TimeoutError:
                 logger.warning(f"[qq-bridge] 黑话抽取超时（{umo}），跳过本次")
-                return f"黑话抽取超时，跳过本次。"
+                return "黑话抽取超时，跳过本次。"
             # 抽取也要记用量：它同样花 token，不记就等于面板上看不见这笔开销
             await self._record_usage(umo=umo, provider_id=provider_id, resp=resp, started=started)
             items = SlangStore.parse_extraction_json(getattr(resp, "completion_text", "") or "")
@@ -1527,21 +1719,20 @@ class QQBridgePlugin(Star):
         if not items:
             return "没有可发送的内容。"
 
-        sent = 0
-        for text in items:
-            text = clean_model_text(text, int(self._cfg("reply.maxChars", 500) or 500))
-            if not text:
-                continue
-            # @ 和引用只挂在第一条上。这两个组件必须真的传给发送函数——
-            # 早期版本在这里构造了 chain 却发的是纯文本，@ 与引用回复静默失效。
-            prefix: list = []
-            if replyToMessageId and sent == 0:
-                prefix.append(Reply(id=str(replyToMessageId)))
-            if atUserId and sent == 0:
-                prefix.append(At(name="", qq=str(atUserId)))
-            if await self._send_text(event, text, prefix=prefix or None):
-                sent += 1
-        self._sent_this_turn[umo] = sent > 0 or self._sent_this_turn.get(umo, False)
+        items = [text for text in items if text.strip()]
+        if not items:
+            return "没有可发送的内容。"
+
+        # @ 和引用只挂在第一条上。这两个组件必须真的传给发送函数——
+        # 早期版本在这里构造了 chain 却发的是纯文本，@ 与引用回复静默失效。
+        prefix: list = []
+        if replyToMessageId:
+            prefix.append(Reply(id=str(replyToMessageId)))
+        if atUserId:
+            prefix.append(At(name="", qq=str(atUserId)))
+        # 整批一次发出：其它插件的 on_llm_response / on_decorating_result
+        # 因此只跑一次，和 AstrBot「一次回复=一条结果链」的语义对齐。
+        sent = await self._send_batch(event, items, umo=umo, prefix=prefix or None)
         return f"已发送 {sent} 条。" if sent else "发送失败。"
 
     @filter.llm_tool(name="qq_reply")

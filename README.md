@@ -14,11 +14,34 @@
 - 交给 AI 时，插件调用 `context.tool_loop_agent()` 起一个带工具的 Agent 回合；
 - 模型的**文本输出只算思考、不会自动发出去**，发言必须调用 `qq_send_message` / `qq_reply`；
 - 不想说话就调用 `qq_dive` 收尾；
-- 回合结束后插件 `event.stop_event()`，阻止 AstrBot 默认对话流程再回一次（否则会重复发言）。
+- 回合结束后插件用 `event.should_call_llm(True)` 压住 AstrBot 默认对话流程（不再 `stop_event`），
+  同样不会重复发言，但其它插件的 handler 和后续管道阶段仍能正常跑。
 
 在此之上保留了原项目的这些人设化能力：人设卡注入、群黑话学习与确认、表情包收藏、
 语音库、拍一拍、轻量记忆、用量统计（走 AstrBot 自带的）、冷场主动开口。
 记忆另配了一个**管理员查看页**（浏览器打开，默认 `http://127.0.0.1:8899/`）。
+
+### 与其它插件兼容（0.3.0 起）
+
+早期版本为了让「AI 自己决定说不说话」成立，把整条回合链路都攥在自己手里，副作用是
+**AstrBot 的标准扩展点全部被绕过**。以
+[astrbot_plugin_Favour_Ultra](https://github.com/nuomicici/astrbot_plugin_Favour_Ultra)
+（好感度）为例，它靠三个钩子工作，而这三个当时一个都不会触发：
+
+| 扩展点 | 早期版本为什么失效 | 现在 |
+| --- | --- | --- |
+| `on_llm_request` | 直接调 `tool_loop_agent()`，不经过 AstrBot 的请求管道 | 每轮先手动触发，插件可改 `system_prompt` / `extra_user_content_parts`，也可 `stop_event()` 拦截 |
+| `on_llm_response` | 同上，且「文本=思考」根本没被当成回复 | 用**真正发出去的文本**合成 `LLMResponse` 触发 |
+| `on_decorating_result` | 发言走 `event.send()` 裸发送，跳过了 `ResultDecorateStage` | 整批文本先过一遍钩子再按条发送 |
+| 工具集 | 只挂本插件 20 个 `qq_*` 工具 | 默认挂全部已启用工具（可用 `agent.tools.mode=own` 回到旧行为） |
+| 事件传播 | `event.stop_event()` 让其它插件 handler 全跳过 | 改用 `should_call_llm(True)`，只压默认 LLM |
+
+配置在 `compat` 一节：`compat.enabled` 是总开关，`compat.hooks`（请求/回复）、
+`compat.decorate`（发送前装饰）可分别关闭；`agent.tools.exclude` 能按工具名屏蔽。
+
+> 已知差异：`on_llm_response` 是按「一次 `qq_send_message` = 一次回复」触发的，不是
+> 每轮只触发一次。这样插件解析到的永远是模型实际说出去的话（而不是内心独白），
+> 代价是一轮里调用多次发言工具时会触发多次。
 
 ---
 
@@ -353,7 +376,10 @@ AstrBot 从较新版本起支持插件在 WebUI 里放自己的页面（`views/`
    function-calling 的模型）时会完全没反应，所以 `agent.fallbackSendThinking` 默认为 `true`：
    整轮没调用任何发言工具时，把模型的文本当回复发出去。要严格照原语义就在配置里关掉。
 10. **本插件会接管它管辖会话的回合。** 命中白名单的会话里，消息由本插件的 Agent 处理，
-   AstrBot 默认对话流程不会参与。想让某个群走默认流程，就别把它放进白名单。
+   AstrBot 默认对话流程不会参与（用 `should_call_llm(True)` 压住）。想让某个群走默认流程，
+   就别把它放进白名单。注意：不再 `stop_event()` 之后，同一事件里其它插件的
+   `event_message_type` handler 仍会照常执行——这正是兼容所需；但如果对方也往群里发消息，
+   你会看到两条回复，那属于两个插件都在发言，不是本插件重复回复。
 11. **记忆查看页是插件自己起的服务，不共享 AstrBot 面板的登录态。** 也就是说它的「管理员」
    由 `memview.host` + `memview.token` 决定，而不是 AstrBot 的账号。默认只监听回环地址时
    只有本机能访问，够用；要远程访问就必须自己设 token（不设会拒绝启动）。页面的写操作
